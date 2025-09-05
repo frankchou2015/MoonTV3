@@ -22,7 +22,7 @@ import {
   subscribeToDataUpdates,
 } from '@/lib/db.client';
 import { SearchResult } from '@/lib/types';
-import { getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
+import { getRequestTimeout,getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
 
 import EpisodeSelector from '@/components/EpisodeSelector';
 import PageLayout from '@/components/PageLayout';
@@ -178,7 +178,7 @@ function PlayPageClient() {
   // 换源加载状态
   const [isVideoLoading, setIsVideoLoading] = useState(true);
   const [videoLoadingStage, setVideoLoadingStage] = useState<
-    'initing' | 'sourceChanging'
+    'initing' | 'sourceChanging' | 'optimizing'
   >('initing');
 
   // 播放进度保存相关
@@ -696,7 +696,8 @@ function PlayPageClient() {
         }
       }
     
-      const cacheKey = `${CACHE_KEY_PREFIX}${query.trim().toLowerCase()}`;
+      // 生成更唯一的缓存键，避免影片名字相同时的缓存冲突
+      const cacheKey = `${CACHE_KEY_PREFIX}${query.trim().toLowerCase()}_${videoYearRef.current || ''}_${searchType || ''}`;
       let aggregatedResults: SearchResult[] = [];
     
       // 提前声明
@@ -708,22 +709,17 @@ function PlayPageClient() {
     
         if (cached) {
           parsed = JSON.parse(cached) as CachedResult;
-          // 判断 timestamp 是否过期，同时检查 results 中的 id 是否一致
-          const idsMatch = parsed.results.every((item, index) => item.title === videoTitle);
-          if (idsMatch) {
-            aggregatedResults = [...parsed.results];
-            setAvailableSources(aggregatedResults);
-            setSourceSearchLoading(false);
-            onResult?.(parsed.results); // 先回调缓存
-          } else {
-            parsed.reSearch = true; // 用对象标记
-          }
+          aggregatedResults = [...parsed.results];
+          setAvailableSources(aggregatedResults);
+          setSourceSearchLoading(false);
+          onResult?.(parsed.results);
         }
     
         // 2. 发起流式搜索请求
         if (!parsed || parsed.reSearch) {
+          const timeoutSeconds = getRequestTimeout();
           const response = await fetch(
-            `/api/search?q=${encodeURIComponent(query.trim())}`
+            `/api/search?q=${encodeURIComponent(query.trim())}&timeout=${timeoutSeconds}`
           );
           if (!response.ok) throw new Error('搜索失败');
     
@@ -753,8 +749,8 @@ function PlayPageClient() {
                     const filteredResults: SearchResult[] = data.pageResults.filter(
                       (r: SearchResult) => {
                         const titleMatch =
-                          r.title.replaceAll(' ', '').toLowerCase() ===
-                          videoTitleRef.current.replaceAll(' ', '').toLowerCase();
+                          r.title.trim().replace(/\s+/g, ' ').toLowerCase() ===
+                          videoTitleRef.current.trim().replace(/\s+/g, ' ').toLowerCase();
                         const yearMatch = videoYearRef.current
                           ? r.year.toLowerCase() ===
                             videoYearRef.current.toLowerCase()
@@ -804,13 +800,15 @@ function PlayPageClient() {
     
         setSourceSearchLoading(false);
     
-        // 最终缓存结果
-        parsed = {
-          timestamp: Date.now(),
-          reSearch: false,
-          results: aggregatedResults,
-        };
-        localStorage.setItem(cacheKey, JSON.stringify(parsed));
+        // 最终缓存结果 - 只有当有结果时才缓存
+        if (aggregatedResults.length > 0) {
+          parsed = {
+            timestamp: Date.now(),
+            reSearch: false,
+            results: aggregatedResults,
+          };
+          localStorage.setItem(cacheKey, JSON.stringify(parsed));
+        }
     
         return aggregatedResults;
       } catch (err) {
@@ -838,24 +836,10 @@ function PlayPageClient() {
       );
     
       let started = false; // 是否已经开始播放
-      let timeoutId: NodeJS.Timeout | null = null;
     
-      // 启动超时计时器
-      const startTimeout = () => {
-        timeoutId = setTimeout(() => {
-          if (!started) {
-            setError('未找到匹配结果');
-            setLoading(false);
-          }
-        }, 15000); // 15秒
-      };
-    
-      startTimeout();
-    
-      await fetchSourcesData(searchTitle || videoTitle, (newResults) => {
+      const results = await fetchSourcesData(videoTitle, (newResults) => {
         if (!started && newResults.length > 0) {
           started = true;
-          if (timeoutId) clearTimeout(timeoutId); // 有结果就清理超时
 
           let detailData = null;
           // 从缓存中读取当前源和 ID
@@ -900,6 +884,12 @@ function PlayPageClient() {
           setTimeout(() => setLoading(false), 500);
         }
       });
+
+      // 如果没有找到匹配结果，设置错误状态
+      if (!started && results.length === 0) {
+        setError('未找到匹配结果');
+        setLoading(false);
+      }
     };    
     
     initAll();
@@ -2061,6 +2051,8 @@ function PlayPageClient() {
                         <p className='text-xl font-semibold text-white animate-pulse'>
                           {videoLoadingStage === 'sourceChanging'
                             ? '🔄 切换播放源...'
+                            : videoLoadingStage === 'optimizing'
+                            ? '⚡ 优选播放源...'
                             : '🔄 视频加载中...'}
                         </p>
                       </div>
@@ -2093,8 +2085,8 @@ function PlayPageClient() {
                 precomputedVideoInfo={precomputedVideoInfo}
                 preferBestSource={preferBestSource}
                 setLoading={setLoading}
-                setLoadingStage={setLoadingStage}
-                setLoadingMessage={setLoadingMessage}
+                setIsVideoLoading={setIsVideoLoading}
+                setVideoLoadingStage={setVideoLoadingStage}
               />
             </div>
           </div>
